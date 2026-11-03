@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#111111">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Bad Bus Dashcam</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main id="app">
+    <!-- Live view: the canvas is what gets recorded, overlay included -->
+    <section id="viewer">
+      <canvas id="canvas"></canvas>
+      <video id="video" playsinline muted autoplay></video>
+      <div id="flash" hidden></div>
+      <div id="start-screen">
+        <h1>Bad Bus Dashcam</h1>
+        <p>Records video with time, GPS position, speed and bus details burned into every frame,
+          and builds a report you can send to the transport authority.</p>
+        <button id="btn-start" class="primary big">Start camera &amp; GPS</button>
+        <p class="small">Camera, microphone and location permission are needed. Nothing is uploaded:
+          everything stays on your phone until you save or share it.</p>
+      </div>
+    </section>
+
+    <!-- Main controls -->
+    <section id="controls" hidden>
+      <div class="row main-row">
+        <button id="btn-details" class="ghost" title="Bus details">🚌 Details</button>
+        <button id="btn-record" class="record" title="Start / stop recording"><span></span></button>
+        <button id="btn-photo" class="ghost" title="Take photo">📷 Photo</button>
+      </div>
+      <div class="row incident-row" id="incident-buttons">
+        <!-- filled by app.js -->
+      </div>
+      <div class="row">
+        <button id="btn-camera-switch" class="ghost small">🔄 Camera</button>
+        <button id="btn-evidence" class="ghost small">🗂 Evidence <span id="evidence-count">0</span></button>
+        <button id="btn-report" class="ghost small">📝 Report</button>
+      </div>
+      <div id="status" class="small"></div>
+    </section>
+  </main>
+
+  <!-- Photo type picker -->
+  <dialog id="dlg-photo">
+    <form method="dialog">
+      <h2>What are you photographing?</h2>
+      <p class="small">The photo is taken from the live camera with the time, GPS position and
+        bus details stamped on it. Hold steady and get close.</p>
+      <div class="grid">
+        <button value="plate">🔢 Number plate</button>
+        <button value="bus_number">🚍 Bus fleet no. / line sign</button>
+        <button value="driver_id">🪪 Driver ID card</button>
+        <button value="driver">🧑 Driver</button>
+        <button value="scene">🚦 Scene / traffic light</button>
+        <button value="other">📎 Other</button>
+      </div>
+      <label class="check"><input type="checkbox" id="photo-fullres" checked> Use full camera resolution when possible (sharper plates)</label>
+      <menu><button value="cancel" class="ghost">Cancel</button></menu>
+    </form>
+  </dialog>
+
+  <!-- Bus details -->
+  <dialog id="dlg-details">
+    <form method="dialog" id="details-form">
+      <h2>Bus details</h2>
+      <p class="small">Shown on the video overlay and in the report. Fill in what you can — you can edit later.</p>
+      <label>Line number <input name="line" inputmode="numeric" autocomplete="off" placeholder="e.g. 480"></label>
+      <label>Operator
+        <input name="operator" list="operators" autocomplete="off" placeholder="e.g. Egged">
+        <datalist id="operators">
+          <option>Egged</option><option>Dan</option><option>Kavim</option><option>Afikim</option>
+          <option>Superbus</option><option>Metropoline</option><option>Electra Afikim</option>
+          <option>Extra</option><option>Nateev Express</option><option>Golan Regional</option>
+          <option>Tnufa</option><option>Beit Shemesh Express</option><option>Galim</option>
+          <option>Nazareth Transport & Tourism</option><option>Dan BaDarom</option><option>Egged Ta'avura</option>
+        </datalist>
+      </label>
+      <label>Number plate <input name="plate" autocomplete="off" placeholder="e.g. 12-345-67"></label>
+      <label>Bus fleet / internal no. <input name="fleet" autocomplete="off" placeholder="number painted on the bus"></label>
+      <label>Direction / destination <input name="direction" autocomplete="off" placeholder="e.g. Tel Aviv Central → Jerusalem"></label>
+      <label>Driver ID / name (if displayed) <input name="driver" autocomplete="off"></label>
+      <label>Boarded at (stop) <input name="boarded" autocomplete="off"></label>
+      <label>Notes <textarea name="notes" rows="3"></textarea></label>
+      <label class="check"><input type="checkbox" name="speedlimit" checked> Look up road speed limits (OpenStreetMap, needs internet)</label>
+      <label class="check"><input type="checkbox" name="audio" checked> Record audio</label>
+      <label>Video quality
+        <select name="quality">
+          <option value="720">720p (smaller files)</option>
+          <option value="1080" selected>1080p (clearer)</option>
+        </select>
+      </label>
+      <menu>
+        <button value="cancel" class="ghost">Cancel</button>
+        <button value="save" class="primary">Save</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <!-- Evidence list -->
+  <dialog id="dlg-evidence">
+    <form method="dialog">
+      <h2>Evidence (this session)</h2>
+      <p class="small">Save or share files <b>before closing the app</b> — they are kept in memory only.</p>
+      <div id="evidence-list"></div>
+      <menu>
+        <button type="button" id="btn-share-all" class="primary">Share / save all</button>
+        <button value="close" class="ghost">Close</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <!-- Report -->
+  <dialog id="dlg-report">
+    <form method="dialog">
+      <h2>Complaint report</h2>
+      <p class="small">Copy this into the Ministry of Transport public transport complaint form
+        (gov.il; info line *8787) or the operator's complaint form. Complaints must be filed within 2 months; anonymous complaints are not handled. Attach the video and photos. For traffic offences you can also go to the police.</p>
+      <textarea id="report-text" rows="16" readonly></textarea>
+      <menu>
+        <button type="button" id="btn-copy-report" class="primary">Copy</button>
+        <button type="button" id="btn-download-report" class="ghost">Download files</button>
+        <a class="ghost button" href="https://www.gov.il/he/service/complaint_about_conduct_in_public_transportation" target="_blank" rel="noopener">Open gov.il form</a>
+        <button value="close" class="ghost">Close</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
