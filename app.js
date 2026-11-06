@@ -1,6 +1,7 @@
 /* Bad Bus Dashcam — records phone video with a burned-in overlay of time, GPS
  * position, speed and bus details, takes stamped photos (plate, driver ID…),
- * logs incidents and builds a complaint report. Runs entirely in the browser. */
+ * logs incidents and builds a complaint report. Everything is grouped into
+ * Reports (one per bus ride) that are saved on the phone as they are recorded. */
 'use strict';
 
 // ---------------------------------------------------------------- constants
@@ -12,19 +13,24 @@ const SPEED_HISTORY_SECONDS = 120;
 const LIMIT_LOOKUP_INTERVAL_MS = 20000;
 const LIMIT_LOOKUP_MIN_MOVE_M = 150;
 const BANNER_MS = 6000;
+const AUDIO_BPS = 128_000;
+const VIDEO_BPS = { '720': 3_000_000, '1080': 6_000_000 };
+const STOP_WHEN_MINUTES_LEFT = 1;   // auto-stop recording before storage is completely full
 
 const INCIDENTS = [
-  { id: 'speeding',     en: 'Speeding',                he: 'מהירות מופרזת' },
-  { id: 'red_light',    en: 'Red light',               he: 'מעבר באור אדום' },
-  { id: 'phone',        en: 'Phone while driving',     he: 'שימוש בטלפון בזמן נהיגה' },
-  { id: 'lane',         en: 'Dangerous overtake/lane', he: 'עקיפה או החלפת נתיב מסוכנת' },
-  { id: 'braking',      en: 'Harsh brake/accel',       he: 'בלימה או האצה חדה' },
-  { id: 'skipped_stop', en: 'Skipped stop',            he: 'לא עצר בתחנה' },
-  { id: 'doors',        en: 'Doors open moving',       he: 'נסיעה עם דלתות פתוחות' },
-  { id: 'behaviour',    en: 'Rude / unsafe conduct',   he: 'התנהגות לא נאותה' },
-  { id: 'other',        en: 'Other',                   he: 'אחר' },
+  { id: 'speeding',  en: 'Speeding',            he: 'מהירות מופרזת' },
+  { id: 'dangerous', en: 'Dangerous driving',   he: 'נהיגה מסוכנת' },
+  { id: 'phone',     en: 'Phone while driving', he: 'שימוש בטלפון בזמן נהיגה' },
+  { id: 'abusive',   en: 'Abusive behaviour',   he: 'התנהגות פוגענית' },
 ];
 const AUTO_OVERSPEED = { id: 'over_limit', en: 'Over speed limit (auto)', he: 'חריגה ממהירות מותרת (אוטומטי)' };
+// Older reports may contain types that were removed from the buttons.
+const LEGACY_INCIDENTS = [
+  { id: 'red_light', en: 'Red light', he: 'מעבר באור אדום' },
+  { id: 'other', en: 'Other', he: 'אחר' },
+];
+const INCIDENT_BY_ID = Object.fromEntries([...INCIDENTS, AUTO_OVERSPEED, ...LEGACY_INCIDENTS].map((t) => [t.id, t]));
+const incidentType = (id) => INCIDENT_BY_ID[id] || { id, en: id, he: id };
 
 const PHOTO_TYPES = {
   plate:      { en: 'Number plate',          he: 'לוחית רישוי' },
@@ -34,6 +40,9 @@ const PHOTO_TYPES = {
   scene:      { en: 'Scene / traffic light', he: 'זירה / רמזור' },
   other:      { en: 'Other',                 he: 'אחר' },
 };
+
+const DETAIL_FIELDS = ['line', 'operator', 'plate', 'fleet', 'direction', 'driver', 'boarded', 'notes'];
+const SETTING_FIELDS = ['speedlimit', 'audio', 'quality'];
 
 // ---------------------------------------------------------------- state
 const $ = (sel) => document.querySelector(sel);
@@ -47,47 +56,42 @@ const state = {
   facingMode: 'environment',
   running: false,
 
-  // GPS
+  // GPS (live, not per report)
   watchId: null,
-  track: [],            // every fix: {t, lat, lon, acc, speedKmh, heading, alt, src}
-  fix: null,            // latest fix
+  fix: null,
   speedKmh: null,
-  maxSpeed: null,       // {kmh, fix}
-  speedHistory: [],     // [{t, kmh}]
+  speedHistory: [],
   gpsError: null,
 
   // speed limit
   limit: null,          // {kmh, name, at: {lat, lon}, t}
   limitPending: false,
-  overspeed: null,      // {start, maxKmh, fix}
+  overspeed: null,
 
   // recording
   recorder: null,
-  recChunks: [],
+  writer: null,
+  recItem: null,
   recStart: null,
   recMime: '',
-  currentRecording: null,
 
-  // evidence & incidents
-  incidents: [],        // {type, t, fix, speedKmh, limitKmh, recording, offsetMs, auto, detail}
-  evidence: [],         // {id, kind, name, blob, url, t, label, info}
-  recordings: [],       // {name, start, end, mime}
-  banner: null,         // {text, until}
+  // reports
+  reports: [],
+  report: null,         // the current report
+  banner: null,
   wakeLock: null,
+  space: null,          // {free, minutes, rate}
 
-  details: loadDetails(),
+  settings: loadSettings(),
 };
 
-function loadDetails() {
-  const defaults = { line: '', operator: '', plate: '', fleet: '', direction: '', driver: '',
-    boarded: '', notes: '', speedlimit: true, audio: true, quality: '1080' };
-  try {
-    const saved = JSON.parse(localStorage.getItem('badbus.details') || '{}');
-    return { ...defaults, ...saved };
-  } catch { return defaults; }
+function loadSettings() {
+  const defaults = { speedlimit: true, audio: true, quality: '1080' };
+  try { return { ...defaults, ...JSON.parse(localStorage.getItem('badbus.settings') || '{}') }; }
+  catch { return defaults; }
 }
-function saveDetails() {
-  try { localStorage.setItem('badbus.details', JSON.stringify(state.details)); } catch { /* private mode */ }
+function saveSettings() {
+  try { localStorage.setItem('badbus.settings', JSON.stringify(state.settings)); } catch { /* private mode */ }
 }
 
 // ---------------------------------------------------------------- formatting
@@ -104,12 +108,25 @@ function parts(t) {
 function fmtDateTime(t) { const p = parts(t); return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second} ${p.timeZoneName}`; }
 function fmtTime(t) { const p = parts(t); return `${p.hour}:${p.minute}:${p.second}`; }
 function fmtDate(t) { const p = parts(t); return `${p.day}/${p.month}/${p.year}`; }
-function fileStamp(t) { const p = parts(t); return `${p.year}${p.month}${p.day}_${p.hour}${p.minute}${p.second}`; }
+function isoDay(t) { const p = parts(t); return `${p.year}-${p.month}-${p.day}`; }
+function hms(t) { const p = parts(t); return `${p.hour}${p.minute}${p.second}`; }
 function fmtDuration(ms) {
   const s = Math.max(0, Math.floor(ms / 1000));
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
   const mm = String(m).padStart(2, '0'), ss = String(sec).padStart(2, '0');
   return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+function fmtBytes(b) {
+  if (b == null) return '';
+  if (b < 1024 * 1024) return `${Math.max(1, Math.round(b / 1024))} KB`;
+  if (b < 1024 ** 3) return `${(b / 1024 ** 2).toFixed(b < 10 * 1024 ** 2 ? 1 : 0)} MB`;
+  return `${(b / 1024 ** 3).toFixed(1)} GB`;
+}
+function fmtMinutes(min) {
+  if (min == null) return '—';
+  if (min >= 600) return `${Math.floor(min / 60)} h`;
+  if (min >= 90) return `${Math.floor(min / 60)} h ${Math.round(min % 60)} min`;
+  return `${Math.max(0, Math.floor(min))} min`;
 }
 function fmtCoord(fix) {
   if (!fix) return 'no GPS fix';
@@ -122,7 +139,7 @@ function compass(deg) {
   return ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'][Math.round(deg / 45) % 8];
 }
 function mapsLink(fix) { return fix ? `https://maps.google.com/?q=${fix.lat.toFixed(6)},${fix.lon.toFixed(6)}` : ''; }
-function round(n) { return n == null ? '—' : Math.round(n); }
+const pad = (n, w = 3) => String(n).padStart(w, '0');
 
 function setStatus(msg, cls = '') {
   const el = $('#status');
@@ -143,6 +160,98 @@ function bearing(a, b) {
   const x = Math.cos(toRad(a.lat)) * Math.sin(toRad(b.lat)) -
             Math.sin(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.cos(toRad(b.lon - a.lon));
   return (toDeg(Math.atan2(y, x)) + 360) % 360;
+}
+
+// ---------------------------------------------------------------- reports
+function reportTitle(r) {
+  return `Report #${r.number}${r.details.line ? ` · Line ${r.details.line}` : ''}`;
+}
+function reportFolderName(r) {
+  const line = r.details.line ? `_Line-${r.details.line.replace(/[^\w-]+/g, '')}` : '';
+  return `BadBus-Report-${pad(r.number)}_${isoDay(r.createdAt)}${line}`;
+}
+function reportCounts(r) {
+  const videos = r.items.filter((i) => i.kind === 'video').length;
+  const photos = r.items.filter((i) => i.kind === 'photo').length;
+  const size = r.items.reduce((n, i) => n + (i.size || 0), 0);
+  return { videos, photos, incidents: r.incidents.length, size };
+}
+function countsText(r) {
+  const c = reportCounts(r);
+  const bits = [];
+  bits.push(`${c.videos} video${c.videos === 1 ? '' : 's'}`);
+  bits.push(`${c.photos} photo${c.photos === 1 ? '' : 's'}`);
+  bits.push(`${c.incidents} incident${c.incidents === 1 ? '' : 's'}`);
+  if (c.size) bits.push(fmtBytes(c.size));
+  return bits.join(' · ');
+}
+
+async function createReport() {
+  const number = Math.max(0, ...state.reports.map((r) => r.number)) + 1;
+  const r = {
+    id: `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+    number, createdAt: Date.now(), updatedAt: Date.now(),
+    details: Object.fromEntries(DETAIL_FIELDS.map((k) => [k, ''])),
+    incidents: [], items: [], track: [], maxSpeed: null,
+  };
+  state.reports.push(r);
+  await setCurrentReport(r);
+  await persist(r, true);
+  return r;
+}
+
+async function setCurrentReport(r) {
+  state.report = r;
+  state.overspeed = null;
+  state.speedHistory = [];
+  await Store.kvSet('currentReport', r.id);
+  updateReportChip();
+}
+
+const persistTimers = new Map();
+function persist(r, now = false) {
+  r.updatedAt = Date.now();
+  clearTimeout(persistTimers.get(r.id));
+  const save = () => { persistTimers.delete(r.id); return Store.putReport(r).catch((e) => console.error('save failed', e)); };
+  if (now) return save();
+  persistTimers.set(r.id, setTimeout(save, 3000));
+  return Promise.resolve();
+}
+
+async function loadReports() {
+  state.reports = (await Store.listReports().catch(() => [])) || [];
+  // A recording that was cut off (app closed / crashed) — keep what was written.
+  for (const r of state.reports) {
+    let changed = false;
+    for (const item of r.items) {
+      if (item.status === 'recording') {
+        const f = await Store.getFile(r.id, item.name);
+        if (f && f.size) {
+          item.status = 'recovered';
+          item.size = f.size;
+          item.end = item.end || item.t + 1000;
+        } else {
+          item.status = 'missing';
+        }
+        changed = true;
+      }
+    }
+    if (changed) await persist(r, true);
+  }
+  const currentId = await Store.kvGet('currentReport');
+  const current = state.reports.find((r) => r.id === currentId) ||
+                  [...state.reports].sort((a, b) => b.updatedAt - a.updatedAt)[0];
+  if (current) await setCurrentReport(current);
+  else await createReport();
+}
+
+function updateReportChip() {
+  const r = state.report;
+  if (!r) return;
+  const c = reportCounts(r);
+  $('#report-chip-title').textContent = `Report #${r.number}`;
+  $('#report-chip-count').textContent = c.videos + c.photos + c.incidents;
+  $('#start-report').textContent = `Current: ${reportTitle(r)} — ${countsText(r)}`;
 }
 
 // ---------------------------------------------------------------- GPS
@@ -183,15 +292,19 @@ function onPosition(pos) {
 
   state.gpsError = null;
   state.fix = fix;
-  state.track.push(fix);
+  const r = state.report;
+  if (r) {
+    r.track.push(fix);
+    persist(r);
+  }
   if (fix.speedKmh != null) {
     state.speedKmh = fix.speedKmh;
     state.speedHistory.push({ t: fix.t, kmh: fix.speedKmh });
     const cutoff = fix.t - SPEED_HISTORY_SECONDS * 1000;
     while (state.speedHistory.length && state.speedHistory[0].t < cutoff) state.speedHistory.shift();
     // Ignore poor-accuracy fixes for the "max speed" record so it stays credible.
-    if (fix.acc <= 30 && (!state.maxSpeed || fix.speedKmh > state.maxSpeed.kmh)) {
-      state.maxSpeed = { kmh: fix.speedKmh, fix };
+    if (r && fix.acc <= 30 && (!r.maxSpeed || fix.speedKmh > r.maxSpeed.kmh)) {
+      r.maxSpeed = { kmh: fix.speedKmh, fix };
     }
   }
   checkOverspeed(fix);
@@ -201,7 +314,7 @@ function onPosition(pos) {
 
 // ---------------------------------------------------------------- speed limit (OpenStreetMap)
 function maybeLookupLimit(fix) {
-  if (!state.details.speedlimit || state.limitPending || !navigator.onLine) return;
+  if (!state.settings.speedlimit || state.limitPending || !navigator.onLine) return;
   const l = state.limit;
   if (l && Date.now() - l.t < LIMIT_LOOKUP_INTERVAL_MS && haversine(l.at, fix) < LIMIT_LOOKUP_MIN_MOVE_M) return;
   if (l && haversine(l.at, fix) < 30 && Date.now() - l.t < 120000) return;
@@ -267,6 +380,7 @@ function checkOverspeed(fix) {
       o.incident.speedKmh = o.maxKmh;
       o.incident.fix = o.fix;
       o.incident.detail = `${Math.round(o.maxKmh)} km/h in a ${Math.round(o.limit)} zone for ${Math.round((fix.t - o.start) / 1000)} s`;
+      if (state.report) persist(state.report);
     }
   } else {
     state.overspeed = null;
@@ -276,7 +390,7 @@ function checkOverspeed(fix) {
 // ---------------------------------------------------------------- camera
 async function startCamera() {
   stopVideoStream();
-  const tall = state.details.quality === '1080';
+  const tall = state.settings.quality === '1080';
   state.videoStream = await navigator.mediaDevices.getUserMedia({
     video: {
       facingMode: { ideal: state.facingMode },
@@ -290,7 +404,7 @@ async function startCamera() {
 }
 
 async function startAudio() {
-  if (!state.details.audio || state.audioStream) return;
+  if (!state.settings.audio || state.audioStream) return;
   try {
     state.audioStream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true },
@@ -318,8 +432,9 @@ function render() {
 }
 
 function busLine() {
-  const d = state.details;
+  const d = state.report ? state.report.details : {};
   const bits = [];
+  if (state.report) bits.push(`REPORT #${state.report.number}`);
   if (d.line) bits.push(`LINE ${d.line}`);
   if (d.operator) bits.push(d.operator);
   if (d.plate) bits.push(`PLATE ${d.plate}`);
@@ -329,7 +444,7 @@ function busLine() {
 
 function drawHud(g, w, h, now, opts = {}) {
   const s = Math.min(w, h) / 720;           // scale: 1.0 at 720p
-  const pad = Math.round(14 * s);
+  const padPx = Math.round(14 * s);
   const font = (px, weight = 600) => `${weight} ${Math.round(px * s)}px ui-monospace, Menlo, Consolas, "DejaVu Sans Mono", monospace`;
   g.save();
   g.textBaseline = 'top';
@@ -350,28 +465,27 @@ function drawHud(g, w, h, now, opts = {}) {
   const topH = Math.round(76 * s);
   g.fillStyle = 'rgba(0,0,0,0.45)';
   g.fillRect(0, 0, w, topH);
-  text(fmtDateTime(now), pad, pad, 26);
+  text(fmtDateTime(now), padPx, padPx, 26);
   const bus = busLine();
-  if (bus) text(bus, pad, pad + 32 * s, 20, '#ffcc00');
+  if (bus) text(bus, padPx, padPx + 32 * s, 20, '#ffcc00');
 
   if (opts.photoLabel) {
-    text(`PHOTO: ${opts.photoLabel.toUpperCase()}`, w - pad, pad, 24, '#ffcc00', 700, 'right');
+    text(`PHOTO: ${opts.photoLabel.toUpperCase()}`, w - padPx, padPx, 24, '#ffcc00', 700, 'right');
   } else if (state.recorder) {
     const blink = Math.floor(now / 500) % 2 === 0;
     const t = `REC ${fmtDuration(now - state.recStart)}`;
-    const tw = text(t, w - pad, pad, 26, '#fff', 700, 'right');
+    const tw = text(t, w - padPx, padPx, 26, '#fff', 700, 'right');
     if (blink) {
       g.fillStyle = '#ff3b30';
       g.beginPath();
-      g.arc(w - pad - tw - 16 * s, pad + 13 * s, 9 * s, 0, Math.PI * 2);
+      g.arc(w - padPx - tw - 16 * s, padPx + 13 * s, 9 * s, 0, Math.PI * 2);
       g.fill();
     }
   } else {
-    text('LIVE', w - pad, pad, 22, '#a3a6ad', 700, 'right');
+    text('LIVE', w - padPx, padPx, 22, '#a3a6ad', 700, 'right');
   }
-  if (state.details.direction && !opts.photoLabel) {
-    text(`→ ${state.details.direction}`, w - pad, pad + 32 * s, 18, '#fff', 500, 'right');
-  }
+  const dir = state.report && state.report.details.direction;
+  if (dir && !opts.photoLabel) text(`→ ${dir}`, w - padPx, padPx + 32 * s, 18, '#fff', 500, 'right');
 
   // --- bottom band: speed, position, speed graph
   const botH = Math.round(150 * s);
@@ -388,33 +502,33 @@ function drawHud(g, w, h, now, opts = {}) {
   else if (limit != null && speed > limit + OVERSPEED_MARGIN_KMH) speedColor = '#ff3b30';
 
   const speedStr = speed == null ? '--' : String(Math.round(speed));
-  const sw = text(speedStr, pad, by + pad - 4 * s, 72, speedColor, 800);
-  text('km/h', pad + sw + 8 * s, by + pad + 36 * s, 22, speedColor, 700);
+  const sw = text(speedStr, padPx, by + padPx - 4 * s, 72, speedColor, 800);
+  text('km/h', padPx + sw + 8 * s, by + padPx + 36 * s, 22, speedColor, 700);
 
-  const limitStr = limit != null ? `LIMIT ${Math.round(limit)}` : (state.details.speedlimit ? 'LIMIT ?' : '');
-  const maxStr = state.maxSpeed ? `MAX ${Math.round(state.maxSpeed.kmh)}` : 'MAX --';
-  text(`${maxStr}   ${limitStr}`, pad, by + pad + 80 * s, 20, '#fff', 600);
+  const maxSpeed = state.report && state.report.maxSpeed;
+  const limitStr = limit != null ? `LIMIT ${Math.round(limit)}` : (state.settings.speedlimit ? 'LIMIT ?' : '');
+  const maxStr = maxSpeed ? `MAX ${Math.round(maxSpeed.kmh)}` : 'MAX --';
+  text(`${maxStr}   ${limitStr}`, padPx, by + padPx + 80 * s, 20, '#fff', 600);
   if (state.limit && state.limit.name && limit != null) {
-    text(truncate(state.limit.name, 22), pad, by + pad + 106 * s, 16, '#a3a6ad', 500);
+    text(truncate(state.limit.name, 22), padPx, by + padPx + 106 * s, 16, '#a3a6ad', 500);
   }
 
   // position block
   const px = Math.round(w * (w > h ? 0.30 : 0.42));
   const lineGap = 28 * s;
   if (fix) {
-    text(fmtCoord(fix), px, by + pad, 22);
+    text(fmtCoord(fix), px, by + padPx, 22);
     const head = fix.heading != null && !Number.isNaN(fix.heading) ? `HDG ${Math.round(fix.heading)}° ${compass(fix.heading)}` : 'HDG --';
     const alt = fix.alt != null ? `ALT ${Math.round(fix.alt)} m` : '';
-    text(`±${Math.round(fix.acc)} m   ${head}   ${alt}`, px, by + pad + lineGap, 18, '#ddd', 500);
+    text(`±${Math.round(fix.acc)} m   ${head}   ${alt}`, px, by + padPx + lineGap, 18, '#ddd', 500);
     const age = Math.round((now - fix.t) / 1000);
     text(stale ? `GPS FIX ${age}s OLD` : `GPS ${fmtTime(fix.t)}  (${fix.src === 'gps' ? 'doppler' : 'computed'})`,
-      px, by + pad + lineGap * 2, 16, stale ? '#ffcc00' : '#a3a6ad', 500);
+      px, by + padPx + lineGap * 2, 16, stale ? '#ffcc00' : '#a3a6ad', 500);
   } else {
-    text(state.gpsError || 'WAITING FOR GPS…', px, by + pad, 22, '#ffcc00');
+    text(state.gpsError || 'WAITING FOR GPS…', px, by + padPx, 22, '#ffcc00');
   }
 
-  // speed graph (landscape / wide enough only)
-  if (w > h) drawSpeedGraph(g, w - pad - 260 * s, by + pad, 260 * s, botH - pad * 2, s, now, limit);
+  if (w > h) drawSpeedGraph(g, w - padPx - 260 * s, by + padPx, 260 * s, botH - padPx * 2, s, now, limit);
 
   // --- incident banner
   if (state.banner && now < state.banner.until && !opts.photoLabel) {
@@ -470,10 +584,44 @@ function roundRect(g, x, y, w, h, r) {
 }
 function truncate(s, n) { return s.length > n ? s.slice(0, n - 1) + '…' : s; }
 
+// ---------------------------------------------------------------- storage space
+function nominalBytesPerSec() {
+  return ((VIDEO_BPS[state.settings.quality] || VIDEO_BPS['1080']) + (state.settings.audio ? AUDIO_BPS : 0)) / 8;
+}
+
+async function updateSpace() {
+  const est = await Store.estimate();
+  let rate = nominalBytesPerSec();
+  // Once a recording has run a little while, use its real data rate instead.
+  if (state.recorder && state.writer) {
+    const secs = (Date.now() - state.recStart) / 1000;
+    if (secs >= 10 && state.writer.bytes > 0) rate = state.writer.bytes / secs;
+  }
+  if (!est) { state.space = null; renderSpaceChip(); return; }
+  let free = est.free;
+  if (Store.usingMemory) free = Math.min(free, 1.5 * 1024 ** 3); // memory fallback: be conservative
+  state.space = { free, rate, minutes: free / rate / 60 };
+  renderSpaceChip();
+  if (state.recorder && state.space.minutes < STOP_WHEN_MINUTES_LEFT) {
+    stopRecording();
+    setStatus('Storage almost full — recording stopped. Save and delete old reports to free space.', 'err');
+  }
+}
+
+function renderSpaceChip() {
+  const chip = $('#space-chip');
+  if (!state.space) { chip.hidden = true; return; }
+  const m = state.space.minutes;
+  chip.hidden = false;
+  chip.className = m < 10 ? 'chip err' : m < 30 ? 'chip warn' : 'chip';
+  chip.textContent = `💾 ${fmtMinutes(m)} left at ${state.settings.quality}p`;
+  chip.title = `About ${fmtBytes(state.space.free)} available to the app, recording ≈ ${fmtBytes(state.space.rate * 60)}/min`;
+}
+
 // ---------------------------------------------------------------- recording
 function pickMime() {
   const types = [
-    'video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/mp4;codecs=avc1', 'video/mp4',
+    'video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4;codecs=avc1', 'video/mp4',
     'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm',
   ];
   if (!window.MediaRecorder) return null;
@@ -481,66 +629,131 @@ function pickMime() {
 }
 
 async function startRecording() {
+  if (state.recorder) return;
   const mime = pickMime();
   if (mime === null) { setStatus('This browser cannot record video (no MediaRecorder).', 'err'); return; }
-  await startAudio();
-  const out = canvas.captureStream(30);
-  if (state.audioStream) state.audioStream.getAudioTracks().forEach((t) => out.addTrack(t));
-  const bps = state.details.quality === '1080' ? 6_000_000 : 3_000_000;
-  let rec;
-  try {
-    rec = new MediaRecorder(out, mime ? { mimeType: mime, videoBitsPerSecond: bps } : { videoBitsPerSecond: bps });
-  } catch {
-    rec = new MediaRecorder(out);
+  if (state.space && state.space.minutes < STOP_WHEN_MINUTES_LEFT + 1) {
+    setStatus('Not enough storage left to record. Save and delete old reports first.', 'err');
+    return;
   }
-  state.recChunks = [];
-  state.recMime = rec.mimeType || mime || 'video/webm';
-  state.recStart = Date.now();
-  const ext = state.recMime.includes('mp4') ? 'mp4' : 'webm';
-  state.currentRecording = { name: `bad-bus_${fileStamp(state.recStart)}.${ext}`, start: state.recStart, end: null, mime: state.recMime };
-  rec.ondataavailable = (e) => { if (e.data && e.data.size) state.recChunks.push(e.data); };
-  rec.onstop = finishRecording;
-  rec.start(1000);
-  state.recorder = rec;
-  $('#btn-record').classList.add('on');
-  setStatus('Recording — keep this screen open', 'warn');
-  requestWakeLock();
+  hidePostRecord();
+  const btn = $('#btn-record');
+  btn.disabled = true;
+  try {
+    await startAudio();
+    const out = canvas.captureStream(30);
+    if (state.audioStream) state.audioStream.getAudioTracks().forEach((t) => out.addTrack(t));
+    const bps = VIDEO_BPS[state.settings.quality] || VIDEO_BPS['1080'];
+    let rec;
+    try {
+      rec = new MediaRecorder(out, mime ? { mimeType: mime, videoBitsPerSecond: bps, audioBitsPerSecond: AUDIO_BPS } : { videoBitsPerSecond: bps });
+    } catch {
+      rec = new MediaRecorder(out);
+    }
+    const r = state.report;
+    const start = Date.now();
+    const recMime = rec.mimeType || mime || 'video/webm';
+    const ext = recMime.includes('mp4') ? 'mp4' : 'webm';
+    const n = r.items.filter((i) => i.kind === 'video').length + 1;
+    const item = {
+      kind: 'video', name: `video-${pad(n, 2)}_${hms(start)}.${ext}`, mime: recMime.split(';')[0],
+      t: start, end: null, size: 0, status: 'recording',
+    };
+    const writer = await Store.openWriter(r.id, item.name);
+    item.storage = writer.kind;
+    r.items.push(item);
+    await persist(r, true);
+
+    rec.ondataavailable = (e) => {
+      if (!e.data || !e.data.size) return;
+      item.size += e.data.size;
+      writer.write(e.data).then(() => {
+        if (writer.failed && state.recorder === rec) {
+          stopRecording();
+          setStatus(`Could not save video: ${writer.failed.message}. Storage may be full.`, 'err');
+        }
+      });
+    };
+    rec.onstop = () => finishRecording(r, item, writer);
+    rec.start(1000);   // a chunk every second, written straight to storage
+
+    Object.assign(state, { recorder: rec, writer, recItem: item, recStart: start, recMime });
+    btn.classList.add('on');
+    setStatus(writer.kind === 'opfs'
+      ? 'Recording — saving to phone as it records. Keep this screen open.'
+      : 'Recording — this browser can only keep it in memory; save it right after.', 'warn');
+    updateReportChip();
+    requestWakeLock();
+    updateSpace();
+  } catch (e) {
+    setStatus(`Could not start recording: ${e.message}`, 'err');
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function stopRecording() {
   if (state.recorder && state.recorder.state !== 'inactive') state.recorder.stop();
 }
 
-function finishRecording() {
-  const r = state.currentRecording;
-  r.end = Date.now();
-  const blob = new Blob(state.recChunks, { type: state.recMime.split(';')[0] });
-  state.recordings.push(r);
-  addEvidence({ kind: 'video', name: r.name, blob, t: r.start,
-    label: 'Video', info: `${fmtTime(r.start)}–${fmtTime(r.end)} · ${fmtDuration(r.end - r.start)} · ${mb(blob.size)}` });
+async function finishRecording(r, item, writer) {
   state.recorder = null;
-  state.recChunks = [];
-  state.currentRecording = null;
+  state.writer = null;
+  state.recItem = null;
   $('#btn-record').classList.remove('on');
-  setStatus(`Saved to Evidence: ${r.name} — remember to share/save it`, 'warn');
+  item.end = Date.now();
+  try {
+    await writer.close();
+    item.status = 'done';
+  } catch (e) {
+    item.status = 'recovered';
+    setStatus(`Video saved only partly: ${e.message}`, 'err');
+  }
+  const f = await Store.getFile(r.id, item.name);
+  if (f) item.size = f.size;
+  await persist(r, true);
+  updateReportChip();
+  updateSpace();
+  if (item.status === 'done') {
+    setStatus(`Video saved in ${reportTitle(r)}`);
+    showPostRecord(r, item);
+  }
 }
 
-function mb(bytes) { return `${(bytes / 1048576).toFixed(1)} MB`; }
+// After each recording: a quick way to throw it away if nothing happened.
+let postRecordTimer = null;
+function showPostRecord(r, item) {
+  const bar = $('#post-record');
+  const marked = r.incidents.filter((i) => i.recording === item.name).length;
+  $('#post-record-text').textContent =
+    `Saved ${fmtDuration(item.end - item.t)} video (${fmtBytes(item.size)})` + (marked ? ` · ${marked} incident${marked > 1 ? 's' : ''} marked` : '');
+  bar.hidden = false;
+  bar.dataset.report = r.id;
+  bar.dataset.item = item.name;
+  clearTimeout(postRecordTimer);
+  postRecordTimer = setTimeout(hidePostRecord, 20000);
+}
+function hidePostRecord() {
+  clearTimeout(postRecordTimer);
+  $('#post-record').hidden = true;
+}
 
 // ---------------------------------------------------------------- incidents
 function addIncident(type, extra = {}) {
+  const r = state.report;
   const t = extra.at || Date.now();
-  const rec = state.currentRecording;
+  const rec = state.recItem;
   const inc = {
-    type, t, fix: state.fix, speedKmh: state.speedKmh, limitKmh: currentLimit(),
-    recording: rec ? rec.name : null, offsetMs: rec ? t - rec.start : null,
+    type: type.id, t, fix: state.fix, speedKmh: state.speedKmh, limitKmh: currentLimit(),
+    recording: rec ? rec.name : null, offsetMs: rec ? t - rec.t : null,
     auto: !!extra.auto, detail: extra.detail || '',
   };
-  state.incidents.push(inc);
+  r.incidents.push(inc);
+  persist(r, true);
   state.banner = { text: `! ${type.en.toUpperCase()}  ${fmtTime(t)}`, until: Date.now() + BANNER_MS };
   if (navigator.vibrate) navigator.vibrate(80);
   if (!rec && !extra.auto) setStatus(`Logged "${type.en}" — tip: start recording so the video shows it`, 'warn');
-  updateEvidenceCount();
+  updateReportChip();
   return inc;
 }
 
@@ -585,100 +798,107 @@ async function takePhoto(kind) {
   if (source.close) source.close();
 
   const blob = await new Promise((res) => c.toBlob(res, 'image/jpeg', 0.92));
-  const name = `bad-bus_${fileStamp(now)}_${kind}.jpg`;
-  addEvidence({ kind: 'photo', name, blob, t: now, label: meta.en, photoType: kind, fix: state.fix,
-    info: `${fmtTime(now)} · ${fmtCoord(state.fix)}` });
+  const r = state.report;
+  const item = {
+    kind: 'photo', name: `photo_${kind}_${hms(now)}.jpg`, mime: 'image/jpeg',
+    t: now, size: blob.size, photoType: kind, fix: state.fix, status: 'done',
+  };
+  try {
+    item.storage = await Store.writeFile(r.id, item.name, blob);
+  } catch (e) {
+    setStatus(`Could not save photo: ${e.message}`, 'err');
+    return;
+  }
+  r.items.push(item);
+  await persist(r, true);
+  updateReportChip();
+  updateSpace();
 
   const f = $('#flash');
   f.hidden = false;
   f.style.animation = 'none'; void f.offsetWidth; f.style.animation = '';
   setTimeout(() => { f.hidden = true; }, 300);
-  setStatus(`Photo saved to Evidence: ${meta.en}`);
+  setStatus(`Photo saved in ${reportTitle(r)}: ${meta.en}`);
 }
 
-// ---------------------------------------------------------------- evidence store
-let evId = 0;
-function addEvidence(item) {
-  item.id = ++evId;
-  item.url = URL.createObjectURL(item.blob);
-  state.evidence.push(item);
-  updateEvidenceCount();
-}
-function updateEvidenceCount() {
-  $('#evidence-count').textContent = state.evidence.length + state.incidents.length;
-}
-
-function renderEvidence() {
-  const list = $('#evidence-list');
-  list.innerHTML = '';
-  if (!state.evidence.length && !state.incidents.length) {
-    list.innerHTML = '<p class="empty">Nothing yet. Record a video, take photos, or tap an incident button.</p>';
-    return;
-  }
-  for (const item of [...state.evidence].reverse()) {
-    const row = document.createElement('div');
-    row.className = 'ev';
-    const thumb = item.kind === 'photo' ? document.createElement('img') : document.createElement('video');
-    thumb.src = item.url;
-    if (item.kind === 'video') { thumb.muted = true; thumb.playsInline = true; thumb.preload = 'metadata'; }
-    const meta = document.createElement('div');
-    meta.className = 'meta';
-    meta.innerHTML = `<b></b><span></span>`;
-    meta.querySelector('b').textContent = item.label;
-    meta.querySelector('span').textContent = item.info;
-    const open = button('Open', () => window.open(item.url, '_blank'));
-    const save = button('Save', () => shareOrDownload([item]));
-    row.append(thumb, meta, open, save);
-    list.appendChild(row);
-  }
-  if (state.incidents.length) {
-    const row = document.createElement('div');
-    row.className = 'ev';
-    const meta = document.createElement('div');
-    meta.className = 'meta';
-    meta.innerHTML = '<b></b><span></span>';
-    meta.querySelector('b').textContent = `${state.incidents.length} incident(s) logged`;
-    meta.querySelector('span').textContent = state.incidents.map((i) => `${fmtTime(i.t)} ${i.type.en}`).join(' · ');
-    row.append(meta);
-    list.appendChild(row);
-  }
-}
-function button(label, fn) {
-  const b = document.createElement('button');
-  b.type = 'button'; b.textContent = label; b.addEventListener('click', fn);
-  return b;
+// ---------------------------------------------------------------- deleting (always confirmed)
+function confirmDialog({ title, message, ok = 'Delete', danger = true }) {
+  return new Promise((resolve) => {
+    const d = $('#dlg-confirm');
+    $('#confirm-title').textContent = title;
+    $('#confirm-msg').textContent = message;
+    const b = $('#confirm-ok');
+    b.textContent = ok;
+    b.className = danger ? 'danger' : 'primary';
+    d.returnValue = '';
+    d.onclose = () => resolve(d.returnValue === 'ok');
+    d.showModal();
+  });
 }
 
-async function shareOrDownload(items) {
-  const files = items.map((i) => new File([i.blob], i.name, { type: i.blob.type }));
-  if (navigator.canShare && navigator.canShare({ files })) {
-    try {
-      await navigator.share({ files, title: 'Bus incident evidence' });
-      return;
-    } catch (e) {
-      if (e.name === 'AbortError') return;
-    }
-  }
-  for (const i of items) {
-    const a = document.createElement('a');
-    a.href = i.url || URL.createObjectURL(i.blob);
-    a.download = i.name;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    await new Promise((r) => setTimeout(r, 300));
-  }
+async function deleteItem(r, item) {
+  if (state.recItem === item) { setStatus('Stop recording first', 'warn'); return false; }
+  const linked = r.incidents.filter((i) => i.recording === item.name).length;
+  const what = item.kind === 'video'
+    ? `the ${fmtDuration((item.end || item.t) - item.t)} video recorded at ${fmtTime(item.t)} (${fmtBytes(item.size)})`
+    : `the ${(PHOTO_TYPES[item.photoType] || PHOTO_TYPES.other).en.toLowerCase()} photo taken at ${fmtTime(item.t)}`;
+  const ok = await confirmDialog({
+    title: item.kind === 'video' ? 'Delete this video?' : 'Delete this photo?',
+    message: `This permanently deletes ${what} from your phone. It can't be undone.` +
+      (linked ? `\n\n${linked} incident${linked > 1 ? 's were' : ' was'} marked during this video. They stay in the report, without the video.` : ''),
+  });
+  if (!ok) return false;
+  await Store.deleteFile(r.id, item.name);
+  r.items = r.items.filter((i) => i !== item);
+  for (const inc of r.incidents) if (inc.recording === item.name) inc.recordingDeleted = true;
+  await persist(r, true);
+  updateReportChip();
+  updateSpace();
+  setStatus(`${item.kind === 'video' ? 'Video' : 'Photo'} deleted`);
+  return true;
 }
 
-// ---------------------------------------------------------------- report + data exports
-function buildReport() {
-  const d = state.details;
+async function deleteIncident(r, inc) {
+  const ok = await confirmDialog({
+    title: 'Remove this incident?',
+    message: `${incidentType(inc.type).en} at ${fmtTime(inc.t)} will be removed from the report. Videos and photos are not affected.`,
+    ok: 'Remove',
+  });
+  if (!ok) return false;
+  r.incidents = r.incidents.filter((i) => i !== inc);
+  await persist(r, true);
+  updateReportChip();
+  return true;
+}
+
+async function deleteReport(r) {
+  if (state.recorder && state.report === r) { setStatus('Stop recording first', 'warn'); return false; }
+  const ok = await confirmDialog({
+    title: `Delete ${reportTitle(r)}?`,
+    message: `This permanently deletes everything in it from your phone: ${countsText(r)}.\n\n` +
+      'Make sure you have used "Save to phone" first if you want to keep it. This can\'t be undone.',
+    ok: 'Delete report',
+  });
+  if (!ok) return false;
+  await Store.deleteReport(r.id);
+  state.reports = state.reports.filter((x) => x !== r);
+  if (state.report === r) {
+    const next = [...state.reports].sort((a, b) => b.updatedAt - a.updatedAt)[0];
+    if (next) await setCurrentReport(next); else await createReport();
+  }
+  updateSpace();
+  return true;
+}
+
+// ---------------------------------------------------------------- report text + data files
+function buildReport(r = state.report) {
+  const d = r.details;
   const L = [];
-  const first = state.track[0] || state.fix;
-  const day = state.recordings[0]?.start || state.incidents[0]?.t || first?.t || Date.now();
+  const day = r.items[0]?.t || r.incidents[0]?.t || r.track[0]?.t || r.createdAt;
 
   L.push('תלונה על נהיגה מסוכנת של נהג אוטובוס');
   L.push('Complaint: dangerous driving by a bus driver');
+  L.push(`Bad Bus report #${r.number} — folder ${reportFolderName(r)}`);
   L.push('');
   L.push(`תאריך / Date: ${fmtDate(day)}`);
   if (d.line) L.push(`קו / Line: ${d.line}`);
@@ -691,29 +911,35 @@ function buildReport() {
   L.push('');
 
   L.push('אירועים / Incidents:');
-  if (!state.incidents.length) L.push('  (none logged)');
-  [...state.incidents].sort((a, b) => a.t - b.t).forEach((i, n) => {
-    const bits = [`${n + 1}. ${fmtTime(i.t)} — ${i.type.he} / ${i.type.en}`];
+  if (!r.incidents.length) L.push('  (none logged)');
+  [...r.incidents].sort((a, b) => a.t - b.t).forEach((i, n) => {
+    const type = incidentType(i.type);
+    const bits = [`${n + 1}. ${fmtTime(i.t)} — ${type.he} / ${type.en}`];
     if (i.detail) bits.push(i.detail);
     else if (i.speedKmh != null) bits.push(`speed ${Math.round(i.speedKmh)} km/h${i.limitKmh != null ? ` (limit ${Math.round(i.limitKmh)})` : ''}`);
     if (i.fix) bits.push(`${i.fix.lat.toFixed(5)}, ${i.fix.lon.toFixed(5)} (±${Math.round(i.fix.acc)} m) ${mapsLink(i.fix)}`);
-    if (i.recording) bits.push(i.offsetMs < 0 ? `video ${i.recording} from the start (began before recording)` : `video ${i.recording} at ${fmtDuration(i.offsetMs)}`);
+    if (i.recording && !i.recordingDeleted) {
+      bits.push(i.offsetMs < 0 ? `video ${i.recording} from the start (began before recording)` : `video ${i.recording} at ${fmtDuration(i.offsetMs)}`);
+    }
     L.push('  ' + bits.join(' — '));
   });
   L.push('');
 
-  if (state.maxSpeed) {
-    const m = state.maxSpeed;
+  if (r.maxSpeed) {
+    const m = r.maxSpeed;
     L.push(`מהירות מרבית שנמדדה / Max measured speed: ${Math.round(m.kmh)} km/h at ${fmtTime(m.fix.t)} — ${mapsLink(m.fix)}`);
     L.push('');
   }
 
-  if (state.recordings.length) {
+  const videos = r.items.filter((i) => i.kind === 'video');
+  if (videos.length) {
     L.push('הקלטות וידאו / Video recordings:');
-    for (const r of state.recordings) L.push(`  ${r.name} — ${fmtTime(r.start)}–${fmtTime(r.end)} (${fmtDuration(r.end - r.start)})`);
+    for (const v of videos) {
+      L.push(`  ${v.name} — ${fmtTime(v.t)}–${fmtTime(v.end || v.t)} (${fmtDuration((v.end || v.t) - v.t)})${v.status === 'recovered' ? ' [recovered after interruption]' : ''}`);
+    }
     L.push('');
   }
-  const photos = state.evidence.filter((e) => e.kind === 'photo');
+  const photos = r.items.filter((i) => i.kind === 'photo');
   if (photos.length) {
     L.push('תמונות / Photos:');
     for (const p of photos) {
@@ -733,45 +959,295 @@ function buildReport() {
   return L.join('\n');
 }
 
-function buildGpx() {
+function buildGpx(r = state.report) {
   const esc = (s) => String(s).replace(/[<&>"]/g, (c) => ({ '<': '&lt;', '&': '&amp;', '>': '&gt;', '"': '&quot;' }[c]));
-  const pts = state.track.map((p) =>
+  const pts = r.track.map((p) =>
     `      <trkpt lat="${p.lat}" lon="${p.lon}">${p.alt != null ? `<ele>${p.alt.toFixed(1)}</ele>` : ''}<time>${new Date(p.t).toISOString()}</time>` +
     `<extensions><speed>${p.speedKmh != null ? (p.speedKmh / MS_TO_KMH).toFixed(2) : ''}</speed><hacc>${Math.round(p.acc)}</hacc></extensions></trkpt>`).join('\n');
-  const wpts = state.incidents.filter((i) => i.fix).map((i) =>
-    `  <wpt lat="${i.fix.lat}" lon="${i.fix.lon}"><time>${new Date(i.t).toISOString()}</time><name>${esc(i.type.en)}</name>` +
+  const wpts = r.incidents.filter((i) => i.fix).map((i) =>
+    `  <wpt lat="${i.fix.lat}" lon="${i.fix.lon}"><time>${new Date(i.t).toISOString()}</time><name>${esc(incidentType(i.type).en)}</name>` +
     `<desc>${esc(`${i.speedKmh != null ? Math.round(i.speedKmh) + ' km/h' : ''} ${i.detail}`)}</desc></wpt>`).join('\n');
   return `<?xml version="1.0" encoding="UTF-8"?>
 <gpx version="1.1" creator="Bad Bus Dashcam" xmlns="http://www.topografix.com/GPX/1/1">
 ${wpts}
-  <trk><name>${esc(busLine() || 'Bus ride')}</name><trkseg>
+  <trk><name>${esc(reportTitle(r))}</name><trkseg>
 ${pts}
   </trkseg></trk>
 </gpx>
 `;
 }
 
-function buildJson() {
+function buildJson(r = state.report) {
   return JSON.stringify({
     app: 'Bad Bus Dashcam', exported: new Date().toISOString(), timezone: TZ,
-    bus: state.details,
-    recordings: state.recordings.map((r) => ({ ...r, startISO: new Date(r.start).toISOString(), endISO: new Date(r.end).toISOString() })),
-    photos: state.evidence.filter((e) => e.kind === 'photo').map((p) => ({ file: p.name, type: p.photoType, time: new Date(p.t).toISOString(), fix: p.fix })),
-    incidents: state.incidents.map((i) => ({ type: i.type.id, label: i.type.en, time: new Date(i.t).toISOString(),
-      speedKmh: i.speedKmh, limitKmh: i.limitKmh, fix: i.fix, recording: i.recording, offsetSeconds: i.offsetMs != null ? i.offsetMs / 1000 : null, auto: i.auto, detail: i.detail })),
-    maxSpeed: state.maxSpeed,
-    track: state.track,
+    report: { number: r.number, folder: reportFolderName(r), created: new Date(r.createdAt).toISOString() },
+    bus: r.details,
+    files: r.items.map((i) => ({ file: i.name, kind: i.kind, type: i.photoType, status: i.status, size: i.size,
+      start: new Date(i.t).toISOString(), end: i.end ? new Date(i.end).toISOString() : null, fix: i.fix })),
+    incidents: r.incidents.map((i) => ({ type: i.type, label: incidentType(i.type).en, time: new Date(i.t).toISOString(),
+      speedKmh: i.speedKmh, limitKmh: i.limitKmh, fix: i.fix, recording: i.recordingDeleted ? null : i.recording,
+      offsetSeconds: i.offsetMs != null ? i.offsetMs / 1000 : null, auto: i.auto, detail: i.detail })),
+    maxSpeed: r.maxSpeed,
+    track: r.track,
   }, null, 2);
 }
 
-function reportFiles() {
-  const stamp = fileStamp(Date.now());
-  return [
-    { name: `bad-bus_${stamp}_report.txt`, blob: new Blob([buildReport()], { type: 'text/plain;charset=utf-8' }) },
-    { name: `bad-bus_${stamp}_track.gpx`, blob: new Blob([buildGpx()], { type: 'application/gpx+xml' }) },
-    { name: `bad-bus_${stamp}_data.json`, blob: new Blob([buildJson()], { type: 'application/json' }) },
-  ];
+/** All files of a report, ready to save: videos, photos, report.txt, track.gpx, data.json. */
+async function reportEntries(r, { textOnly = false } = {}) {
+  const entries = [];
+  if (!textOnly) {
+    for (const item of r.items) {
+      const blob = await Store.getFile(r.id, item.name);
+      if (blob) entries.push({ name: item.name, blob, t: item.t });
+    }
+  }
+  const now = Date.now();
+  entries.push({ name: 'report.txt', blob: new Blob([buildReport(r)], { type: 'text/plain' }), t: now });
+  entries.push({ name: 'track.gpx', blob: new Blob([buildGpx(r)], { type: 'application/gpx+xml' }), t: now });
+  entries.push({ name: 'data.json', blob: new Blob([buildJson(r)], { type: 'application/json' }), t: now });
+  return entries;
 }
+
+// ---------------------------------------------------------------- saving to the phone
+function download(blob, name) {
+  const a = document.createElement('a');
+  const url = URL.createObjectURL(blob);
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+async function saveToPhone(r) {
+  const out = $('#save-result');
+  out.textContent = 'Preparing…';
+  try {
+    const entries = await reportEntries(r);
+    const folder = reportFolderName(r);
+    if (Store.canPickFolder) {
+      const path = await Store.exportToFolder(folder, entries);
+      r.savedAt = Date.now();
+      await persist(r, true);
+      out.textContent = `Saved ${entries.length} files to the folder "${path}".`;
+      return;
+    }
+    // iPhone / Android without folder access: the share sheet. "Save to Files" puts them all in one folder.
+    const files = entries
+      .filter((e) => !/\.(gpx|json)$/.test(e.name))  // share sheets reject these types; they're in the .zip
+      .map((e) => new File([e.blob], e.name, { type: e.blob.type }));
+    if (navigator.canShare && navigator.canShare({ files })) {
+      await navigator.share({ files, title: folder });
+      r.savedAt = Date.now();
+      await persist(r, true);
+      out.textContent = 'Shared. On iPhone choose "Save to Files" and create a folder named after the report.';
+      return;
+    }
+    await saveZip(r);
+  } catch (e) {
+    out.textContent = e.name === 'AbortError' ? 'Cancelled.' : `Could not save: ${e.message}. Try "Download .zip".`;
+  }
+}
+
+async function saveZip(r) {
+  const out = $('#save-result');
+  try {
+    const entries = await reportEntries(r);
+    const zip = await Store.makeZip(reportFolderName(r), entries, (i, n, name) => {
+      out.textContent = `Building .zip ${i + 1}/${n}: ${name}…`;
+    });
+    download(zip, `${reportFolderName(r)}.zip`);
+    r.savedAt = Date.now();
+    await persist(r, true);
+    out.textContent = `Downloaded ${reportFolderName(r)}.zip (${fmtBytes(zip.size)}). Open it in Files to get the report folder.`;
+  } catch (e) {
+    out.textContent = `Could not build .zip: ${e.message}`;
+  }
+}
+
+async function saveOne(r, item) {
+  const blob = await Store.getFile(r.id, item.name);
+  if (!blob) { setStatus('File not found', 'err'); return; }
+  const file = new File([blob], item.name, { type: blob.type || item.mime });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try { await navigator.share({ files: [file] }); return; } catch (e) { if (e.name === 'AbortError') return; }
+  }
+  download(blob, item.name);
+}
+
+// ---------------------------------------------------------------- report dialog
+const openUrls = [];
+function trackUrl(url) { openUrls.push(url); return url; }
+function releaseUrls() { while (openUrls.length) URL.revokeObjectURL(openUrls.pop()); }
+
+function el(tag, attrs = {}, ...children) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'onclick') e.addEventListener('click', v);
+    else if (k === 'class') e.className = v;
+    else if (v != null) e.setAttribute(k, v);
+  }
+  for (const c of children) if (c != null) e.append(c);
+  return e;
+}
+
+async function renderReportDialog(r) {
+  releaseUrls();
+  $('#report-title').textContent = reportTitle(r);
+  const d = r.details;
+  $('#report-sub').textContent = [fmtDate(r.createdAt), d.operator, d.plate && `plate ${d.plate}`, d.direction].filter(Boolean).join(' · ') +
+    (r.savedAt ? ` · last saved to phone ${fmtTime(r.savedAt)}` : ' · not saved to phone yet');
+  $('#report-current-note').hidden = r === state.report;
+  $('#btn-make-current').hidden = r === state.report;
+
+  const list = $('#report-items');
+  list.innerHTML = '';
+  if (!r.items.length) list.append(el('p', { class: 'empty' }, 'No videos or photos yet.'));
+  for (const item of [...r.items].sort((a, b) => b.t - a.t)) {
+    const blob = item.status === 'recording' ? null : await Store.getFile(r.id, item.name);
+    const url = blob ? trackUrl(URL.createObjectURL(blob)) : null;
+    let thumb;
+    if (item.kind === 'photo') thumb = el('img', { src: url, alt: '' });
+    else {
+      thumb = el('video', { src: url ? `${url}#t=0.5` : null, muted: '', playsinline: '', preload: 'metadata' });
+      thumb.muted = true;
+    }
+    const label = item.kind === 'video'
+      ? `🎥 Video ${fmtDuration((item.end || Date.now()) - item.t)}`
+      : `📷 ${(PHOTO_TYPES[item.photoType] || PHOTO_TYPES.other).en}`;
+    const statusNote = item.status === 'recording' ? ' · recording…' : item.status === 'recovered' ? ' · recovered' :
+                       item.status === 'missing' ? ' · file missing' : '';
+    const row = el('div', { class: 'ev' },
+      thumb,
+      el('div', { class: 'meta' }, el('b', {}, label), el('span', {}, `${fmtTime(item.t)} · ${fmtBytes(item.size)}${statusNote}`)),
+      el('div', { class: 'actions' },
+        url ? el('button', { type: 'button', onclick: () => openViewer(item, url) }, item.kind === 'video' ? '▶ Play' : 'View') : null,
+        url ? el('button', { type: 'button', onclick: () => saveOne(r, item) }, 'Save') : null,
+        item.status !== 'recording' ? el('button', { type: 'button', class: 'danger-outline', onclick: async () => {
+          if (await deleteItem(r, item)) renderReportDialog(r);
+        } }, 'Delete…') : null),
+    );
+    list.append(row);
+  }
+
+  const incs = $('#report-incidents');
+  incs.innerHTML = '';
+  if (!r.incidents.length) incs.append(el('p', { class: 'empty' }, 'No incidents marked.'));
+  for (const inc of [...r.incidents].sort((a, b) => a.t - b.t)) {
+    const speed = inc.speedKmh != null ? ` · ${Math.round(inc.speedKmh)} km/h` : '';
+    incs.append(el('div', { class: 'ev' },
+      el('div', { class: 'meta' }, el('b', {}, `⚠ ${incidentType(inc.type).en}`),
+        el('span', {}, `${fmtTime(inc.t)}${speed}${inc.recording && !inc.recordingDeleted ? ` · in ${inc.recording} at ${fmtDuration(Math.max(0, inc.offsetMs))}` : ''}`)),
+      el('button', { type: 'button', class: 'danger-outline', onclick: async () => {
+        if (await deleteIncident(r, inc)) renderReportDialog(r);
+      } }, 'Remove…'),
+    ));
+  }
+
+  $('#report-text').value = buildReport(r);
+  $('#save-result').textContent = Store.canPickFolder
+    ? `"Save to phone" copies everything into a folder named ${reportFolderName(r)}.`
+    : `"Save to phone" opens the share sheet — on iPhone pick "Save to Files" and make a folder called ${reportFolderName(r)}. Or use "Download .zip".`;
+  $('#dlg-report').dataset.report = r.id;
+}
+
+function openReport(r) {
+  renderReportDialog(r);
+  if (!$('#dlg-report').open) $('#dlg-report').showModal();
+}
+
+function openViewer(item, url) {
+  const box = $('#viewer-box');
+  box.innerHTML = '';
+  if (item.kind === 'video') {
+    const v = el('video', { src: url, controls: '', playsinline: '', autoplay: '' });
+    box.append(v);
+  } else {
+    box.append(el('img', { src: url, alt: item.name }));
+  }
+  $('#viewer-name').textContent = item.name;
+  $('#dlg-viewer').showModal();
+}
+
+function renderReportsList() {
+  const list = $('#reports-list');
+  list.innerHTML = '';
+  const sorted = [...state.reports].sort((a, b) => b.createdAt - a.createdAt);
+  for (const r of sorted) {
+    const current = r === state.report;
+    list.append(el('div', { class: 'ev' + (current ? ' current' : '') },
+      el('div', { class: 'meta' },
+        el('b', {}, `${reportTitle(r)}${current ? ' (current)' : ''}`),
+        el('span', {}, `${fmtDate(r.createdAt)} · ${countsText(r)}${r.savedAt ? ' · saved ✓' : ''}`)),
+      el('div', { class: 'actions' },
+        el('button', { type: 'button', onclick: () => { $('#dlg-reports').close(); openReport(r); } }, 'Open'),
+        el('button', { type: 'button', class: 'danger-outline', onclick: async () => {
+          if (await deleteReport(r)) renderReportsList();
+        } }, 'Delete…')),
+    ));
+  }
+  Store.estimate().then((est) => {
+    const used = state.reports.reduce((n, r) => n + reportCounts(r).size, 0);
+    $('#reports-space').textContent = `Reports use ${fmtBytes(used)} on this phone` +
+      (est ? ` · about ${fmtBytes(est.free)} free for the app` : '') +
+      (state.space ? ` (≈ ${fmtMinutes(state.space.minutes)} of ${state.settings.quality}p video)` : '');
+  });
+}
+
+async function newReportFlow() {
+  if (state.recorder) {
+    const ok = await confirmDialog({ title: 'Stop recording?', message: 'Recording will stop and be saved in the current report before the new report starts.', ok: 'Stop & continue', danger: false });
+    if (!ok) return;
+    stopRecording();
+    await new Promise((res) => setTimeout(res, 500));
+  }
+  await createReport();
+  hidePostRecord();
+  if ($('#dlg-reports').open) $('#dlg-reports').close();
+  if ($('#dlg-report').open) $('#dlg-report').close();
+  setStatus(`Started ${reportTitle(state.report)}`);
+  openDetails();
+}
+
+// ---------------------------------------------------------------- details & settings
+function openDetails() {
+  const f = $('#details-form');
+  const r = state.report;
+  $('#details-title').textContent = `Bus details — Report #${r.number}`;
+  for (const el2 of f.elements) {
+    if (!el2.name) continue;
+    if (DETAIL_FIELDS.includes(el2.name)) el2.value = r.details[el2.name] || '';
+    else if (SETTING_FIELDS.includes(el2.name)) {
+      if (el2.type === 'checkbox') el2.checked = !!state.settings[el2.name];
+      else el2.value = state.settings[el2.name];
+    }
+  }
+  $('#dlg-details').showModal();
+}
+
+$('#dlg-details').addEventListener('close', async () => {
+  if ($('#dlg-details').returnValue !== 'save') return;
+  const f = $('#details-form');
+  const r = state.report;
+  const prevQuality = state.settings.quality;
+  for (const el2 of f.elements) {
+    if (!el2.name) continue;
+    if (DETAIL_FIELDS.includes(el2.name)) r.details[el2.name] = el2.value.trim();
+    else if (SETTING_FIELDS.includes(el2.name)) state.settings[el2.name] = el2.type === 'checkbox' ? el2.checked : el2.value;
+  }
+  saveSettings();
+  await persist(r, true);
+  updateReportChip();
+  if (!state.settings.audio && state.audioStream && !state.recorder) {
+    state.audioStream.getTracks().forEach((t) => t.stop());
+    state.audioStream = null;
+  }
+  if (state.settings.quality !== prevQuality && state.running) {
+    try { await startCamera(); } catch (e) { setStatus(`Camera: ${e.message}`, 'err'); }
+  }
+  updateSpace();
+});
 
 // ---------------------------------------------------------------- misc
 async function requestWakeLock() {
@@ -807,37 +1283,12 @@ async function start() {
   $('#controls').hidden = false;
   setStatus('Waiting for GPS…', 'warn');
   requestAnimationFrame(render);
+  updateSpace();
+  setInterval(updateSpace, 5000);
 }
-
-function openDetails() {
-  const f = $('#details-form');
-  for (const el of f.elements) {
-    if (!el.name || !(el.name in state.details)) continue;
-    if (el.type === 'checkbox') el.checked = !!state.details[el.name];
-    else el.value = state.details[el.name];
-  }
-  $('#dlg-details').showModal();
-}
-
-$('#dlg-details').addEventListener('close', async () => {
-  if ($('#dlg-details').returnValue !== 'save') return;
-  const f = $('#details-form');
-  const prevQuality = state.details.quality;
-  for (const el of f.elements) {
-    if (!el.name || !(el.name in state.details)) continue;
-    state.details[el.name] = el.type === 'checkbox' ? el.checked : el.value.trim();
-  }
-  saveDetails();
-  if (!state.details.audio && state.audioStream && !state.recorder) {
-    state.audioStream.getTracks().forEach((t) => t.stop());
-    state.audioStream = null;
-  }
-  if (state.details.quality !== prevQuality && state.running) {
-    try { await startCamera(); } catch (e) { setStatus(`Camera: ${e.message}`, 'err'); }
-  }
-});
 
 $('#btn-start').addEventListener('click', start);
+$('#btn-start-reports').addEventListener('click', () => { renderReportsList(); $('#dlg-reports').showModal(); });
 $('#btn-details').addEventListener('click', openDetails);
 $('#btn-record').addEventListener('click', () => (state.recorder ? stopRecording() : startRecording()));
 $('#btn-photo').addEventListener('click', () => $('#dlg-photo').showModal());
@@ -849,37 +1300,65 @@ $('#btn-camera-switch').addEventListener('click', async () => {
   state.facingMode = state.facingMode === 'environment' ? 'user' : 'environment';
   try { await startCamera(); } catch (e) { setStatus(`Camera: ${e.message}`, 'err'); }
 });
-$('#btn-evidence').addEventListener('click', () => { renderEvidence(); $('#dlg-evidence').showModal(); });
-$('#btn-share-all').addEventListener('click', () => shareOrDownload([...state.evidence, ...reportFiles()]));
-$('#btn-report').addEventListener('click', () => {
-  $('#report-text').value = buildReport();
-  $('#dlg-report').showModal();
+$('#btn-report').addEventListener('click', () => openReport(state.report));
+$('#btn-reports').addEventListener('click', () => { renderReportsList(); $('#dlg-reports').showModal(); });
+$('#btn-new-report').addEventListener('click', newReportFlow);
+$('#btn-new-report-2').addEventListener('click', newReportFlow);
+
+const dialogReport = () => state.reports.find((r) => r.id === $('#dlg-report').dataset.report) || state.report;
+$('#btn-save-phone').addEventListener('click', () => saveToPhone(dialogReport()));
+$('#btn-save-zip').addEventListener('click', () => saveZip(dialogReport()));
+$('#btn-edit-details').addEventListener('click', () => {
+  if (dialogReport() !== state.report) return;
+  $('#dlg-report').close();
+  openDetails();
+});
+$('#btn-make-current').addEventListener('click', async () => {
+  if (state.recorder) { setStatus('Stop recording first', 'warn'); return; }
+  await setCurrentReport(dialogReport());
+  renderReportDialog(state.report);
+  setStatus(`Now adding to ${reportTitle(state.report)}`);
 });
 $('#btn-copy-report').addEventListener('click', async () => {
   const ta = $('#report-text');
   try { await navigator.clipboard.writeText(ta.value); }
   catch { ta.select(); document.execCommand('copy'); }
   $('#btn-copy-report').textContent = 'Copied ✓';
-  setTimeout(() => { $('#btn-copy-report').textContent = 'Copy'; }, 1500);
+  setTimeout(() => { $('#btn-copy-report').textContent = 'Copy text'; }, 1500);
 });
-$('#btn-download-report').addEventListener('click', () => shareOrDownload(reportFiles()));
+$('#dlg-report').addEventListener('close', releaseUrls);
+$('#dlg-viewer').addEventListener('close', () => { $('#viewer-box').innerHTML = ''; });
+
+$('#btn-post-keep').addEventListener('click', hidePostRecord);
+$('#btn-post-delete').addEventListener('click', async () => {
+  const bar = $('#post-record');
+  const r = state.reports.find((x) => x.id === bar.dataset.report);
+  const item = r && r.items.find((i) => i.name === bar.dataset.item);
+  clearTimeout(postRecordTimer);
+  if (!item) { hidePostRecord(); return; }
+  if (await deleteItem(r, item)) hidePostRecord();
+  else postRecordTimer = setTimeout(hidePostRecord, 20000);
+});
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
     if (state.running) requestWakeLock();
-  } else if (state.recorder) {
-    // Browsers pause canvas drawing in the background, so the video would freeze.
-    setStatus('App was in the background — the video may have frozen during that time', 'warn');
+  } else {
+    if (state.report) persist(state.report, true);
+    if (state.recorder) setStatus('App was in the background — the video may have frozen during that time', 'warn');
   }
 });
 window.addEventListener('beforeunload', (e) => {
-  if (state.recorder || state.evidence.length) { e.preventDefault(); e.returnValue = ''; }
+  if (state.report) Store.putReport(state.report);
+  if (state.recorder) { e.preventDefault(); e.returnValue = ''; }
 });
 
 buildIncidentButtons();
+Store.persist();   // ask the browser not to clear our storage when the phone is low on space
+loadReports().then(updateReportChip).catch((e) => setStatus(`Storage error: ${e.message}`, 'err'));
 if ('serviceWorker' in navigator && location.protocol === 'https:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 
 // Exposed for testing in the browser console.
-window.__badbus = { state, buildReport, buildGpx, buildJson, onPosition };
+window.__badbus = { state, buildReport, buildGpx, buildJson, onPosition, Store, reportEntries, deleteItem, createReport };

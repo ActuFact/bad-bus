@@ -15,16 +15,29 @@ using a phone while driving and so on. Every video frame and photo gets a **burn
 
 | | |
 |---|---|
-| **Video** | Records camera + overlay + audio (MP4 on iPhone and recent Chrome, WebM elsewhere). |
+| **Reports** | Everything is grouped into a **Report**, one per bus ride or incident. Tap **＋ New** to start a fresh report (e.g. when you change buses). **🗂 All** lists every report on the phone and lets you open, continue or delete one. |
+| **Video** | Records camera + overlay + audio (MP4 on iPhone and recent Chrome, WebM elsewhere). The video is **written to the phone's storage every second while it records**, so a crash or closing the app loses only the last few seconds. |
+| **Quick delete** | Start filming as soon as something *might* happen. When you stop, a bar offers **Delete…** or **Keep**. Every delete (video, photo, incident or whole report) asks for confirmation first. |
+| **Space left** | A chip at the top of the screen shows about how many **minutes of recording space** are left at the chosen quality (≈ 46 MB/min at 1080p, ≈ 23 MB/min at 720p; once recording it uses the real rate). It turns amber under 30 min and red under 10, and recording stops by itself just before storage is full. |
 | **Photos** | Choose a type (number plate, fleet number or line sign, driver ID card, driver, scene or traffic light), and the photo is stamped with time, GPS and bus details. Uses full camera resolution on Android Chrome for sharper plates. |
-| **Incident buttons** | One tap logs *Speeding, Red light, Phone while driving, Dangerous overtake, Harsh braking, Skipped stop, Doors open while moving, Rude conduct, Other* with time, location, speed and position in the video. |
+| **Incident buttons** | Four one-tap buttons: *Speeding, Dangerous driving, Phone while driving, Abusive behaviour*. Each logs the time, location, speed and position in the video. |
 | **Auto over-limit** | If speed stays more than 5 km/h over the OSM limit for 5 s or longer, an incident is logged automatically. |
-| **Report** | A bilingual (Hebrew/English) complaint text with every incident, Google Maps links, timestamps inside the video, the max speed, and lists of the video and photo files. You can copy it or download it. |
-| **Data export** | GPX track (opens in Google Earth or any map app) and a full JSON log of every GPS fix. |
-| **Share / save** | Uses the phone's share sheet (WhatsApp, Drive, Files…) or downloads the files. |
+| **Save to phone** | Puts the whole report in **one folder** named like `BadBus-Report-003_2026-11-06_Line-480/`, containing the videos, photos, `report.txt` (the case file), `track.gpx` and `data.json`. See below. |
 
 Nothing is uploaded anywhere. The only network request is the optional speed-limit lookup
 to the OpenStreetMap Overpass API, which sends coordinates only.
+
+## Where files are kept
+
+1. **While you record:** in the browser's private storage for this app (it survives closing the app and
+   restarting the phone, but you can't see it in the Files or Photos app). The app asks the browser to keep it
+   permanently. A recording cut off by a crash is recovered and marked *recovered*.
+2. **Save to phone** (in a report) copies it somewhere you can see it:
+   - **Android / desktop Chrome:** you pick a folder once (e.g. *Documents*); each report becomes a subfolder in it.
+   - **iPhone:** the share sheet opens. Choose **Save to Files** and create a folder with the report's name;
+     all the files go into it together. **Save Video** puts a video in Photos instead.
+   - **Download .zip** (any phone): one `.zip` that opens as the report folder. In the iPhone Files app, tap it to unzip.
+3. After saving, you can delete the report in the app to free up space.
 
 ## Running it
 
@@ -45,7 +58,7 @@ To run locally: `python3 -m http.server 8000` and open `http://localhost:8000`.
   gov.il form asks for the bus licence number, the line number and the driver's details.
 - Hold the phone steady against a window. Speed is most accurate with a clear view of the sky
   (watch the ±m value).
-- **Save or share your files before closing the app.** Recordings are kept in memory only.
+- Use a new report for each bus, so each folder holds one complaint.
 - Don't distract or confront the driver.
 
 ## Where to complain
@@ -60,5 +73,5 @@ To run locally: `python3 -m http.server 8000` and open `http://localhost:8000`.
 
 ## Files
 
-`index.html`, `style.css`, `app.js` (all logic), `sw.js` (offline cache), `manifest.webmanifest`, `icons/`.
+`index.html`, `style.css`, `app.js` (capture, overlay, reports UI), `storage.js` (saving, export, zip), `opfs-worker.js` (writes video while recording), `sw.js` (offline cache), `manifest.webmanifest`, `icons/`.
 No build step and no dependencies.

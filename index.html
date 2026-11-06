@@ -18,31 +18,40 @@
     <section id="viewer">
       <canvas id="canvas"></canvas>
       <video id="video" playsinline muted autoplay></video>
+      <div id="space-chip" class="chip" hidden></div>
       <div id="flash" hidden></div>
       <div id="start-screen">
         <h1>Bad Bus Dashcam</h1>
         <p>Records video with time, GPS position, speed and bus details burned into every frame,
-          and builds a report you can send to the transport authority.</p>
+          saves it on your phone as it records, and builds a report you can send to the transport authority.</p>
         <button id="btn-start" class="primary big">Start camera &amp; GPS</button>
+        <button id="btn-start-reports" class="ghost">📁 Saved reports</button>
+        <p id="start-report" class="small"></p>
         <p class="small">Camera, microphone and location permission are needed. Nothing is uploaded:
-          everything stays on your phone until you save or share it.</p>
+          everything stays on your phone.</p>
       </div>
     </section>
 
     <!-- Main controls -->
     <section id="controls" hidden>
+      <div id="post-record" class="post-record" hidden>
+        <span id="post-record-text"></span>
+        <button type="button" id="btn-post-delete" class="danger-outline">Delete…</button>
+        <button type="button" id="btn-post-keep" class="ghost">Keep</button>
+      </div>
       <div class="row main-row">
         <button id="btn-details" class="ghost" title="Bus details">🚌 Details</button>
         <button id="btn-record" class="record" title="Start / stop recording"><span></span></button>
         <button id="btn-photo" class="ghost" title="Take photo">📷 Photo</button>
       </div>
-      <div class="row incident-row" id="incident-buttons">
+      <div class="incident-row" id="incident-buttons">
         <!-- filled by app.js -->
       </div>
       <div class="row">
-        <button id="btn-camera-switch" class="ghost small">🔄 Camera</button>
-        <button id="btn-evidence" class="ghost small">🗂 Evidence <span id="evidence-count">0</span></button>
-        <button id="btn-report" class="ghost small">📝 Report</button>
+        <button id="btn-camera-switch" class="ghost small" title="Switch camera">🔄</button>
+        <button id="btn-report" class="ghost small">📁 <span id="report-chip-title">Report</span> <span id="report-chip-count" class="badge">0</span></button>
+        <button id="btn-reports" class="ghost small">🗂 All</button>
+        <button id="btn-new-report" class="ghost small">＋ New</button>
       </div>
       <div id="status" class="small"></div>
     </section>
@@ -67,11 +76,11 @@
     </form>
   </dialog>
 
-  <!-- Bus details -->
+  <!-- Bus details (per report) + settings (global) -->
   <dialog id="dlg-details">
     <form method="dialog" id="details-form">
-      <h2>Bus details</h2>
-      <p class="small">Shown on the video overlay and in the report. Fill in what you can — you can edit later.</p>
+      <h2 id="details-title">Bus details</h2>
+      <p class="small">Shown on the video overlay and in this report. Fill in what you can — you can edit later.</p>
       <label>Line number <input name="line" inputmode="numeric" autocomplete="off" placeholder="e.g. 480"></label>
       <label>Operator
         <input name="operator" list="operators" autocomplete="off" placeholder="e.g. Egged">
@@ -89,12 +98,13 @@
       <label>Driver ID / name (if displayed) <input name="driver" autocomplete="off"></label>
       <label>Boarded at (stop) <input name="boarded" autocomplete="off"></label>
       <label>Notes <textarea name="notes" rows="3"></textarea></label>
+      <h3>Settings</h3>
       <label class="check"><input type="checkbox" name="speedlimit" checked> Look up road speed limits (OpenStreetMap, needs internet)</label>
       <label class="check"><input type="checkbox" name="audio" checked> Record audio</label>
       <label>Video quality
         <select name="quality">
-          <option value="720">720p (smaller files)</option>
-          <option value="1080" selected>1080p (clearer)</option>
+          <option value="720">720p — about 23 MB per minute</option>
+          <option value="1080" selected>1080p — about 46 MB per minute (clearer)</option>
         </select>
       </label>
       <menu>
@@ -104,35 +114,80 @@
     </form>
   </dialog>
 
-  <!-- Evidence list -->
-  <dialog id="dlg-evidence">
-    <form method="dialog">
-      <h2>Evidence (this session)</h2>
-      <p class="small">Save or share files <b>before closing the app</b> — they are kept in memory only.</p>
-      <div id="evidence-list"></div>
-      <menu>
-        <button type="button" id="btn-share-all" class="primary">Share / save all</button>
-        <button value="close" class="ghost">Close</button>
-      </menu>
-    </form>
-  </dialog>
-
-  <!-- Report -->
+  <!-- One report -->
   <dialog id="dlg-report">
     <form method="dialog">
-      <h2>Complaint report</h2>
+      <h2 id="report-title">Report</h2>
+      <p id="report-sub" class="small"></p>
+      <p id="report-current-note" class="small warn" hidden>You're viewing an older report. New videos and photos go into the current report.</p>
+
+      <h3>Videos &amp; photos</h3>
+      <div id="report-items" class="list"></div>
+
+      <h3>Incidents</h3>
+      <div id="report-incidents" class="list"></div>
+
+      <h3>Save to phone</h3>
+      <div class="btns">
+        <button type="button" id="btn-save-phone" class="primary">💾 Save to phone</button>
+        <button type="button" id="btn-save-zip" class="ghost">Download .zip</button>
+      </div>
+      <p id="save-result" class="small"></p>
+
+      <h3>Complaint text (report.txt)</h3>
       <p class="small">Copy this into the Ministry of Transport public transport complaint form
-        (gov.il; info line *8787) or the operator's complaint form. Complaints must be filed within 2 months; anonymous complaints are not handled. Attach the video and photos. For traffic offences you can also go to the police.</p>
-      <textarea id="report-text" rows="16" readonly></textarea>
-      <menu>
-        <button type="button" id="btn-copy-report" class="primary">Copy</button>
-        <button type="button" id="btn-download-report" class="ghost">Download files</button>
+        (gov.il; info line *8787) or the operator's complaint form. Attach the video and photos.
+        Complaints must be filed within 2 months; anonymous complaints are not handled.
+        For traffic offences you can also go to the police.</p>
+      <textarea id="report-text" rows="12" readonly></textarea>
+      <div class="btns">
+        <button type="button" id="btn-copy-report" class="ghost">Copy text</button>
         <a class="ghost button" href="https://www.gov.il/he/service/complaint_about_conduct_in_public_transportation" target="_blank" rel="noopener">Open gov.il form</a>
+      </div>
+
+      <menu>
+        <button type="button" id="btn-make-current" class="ghost" hidden>Continue this report</button>
+        <button type="button" id="btn-edit-details" class="ghost">Edit bus details</button>
+        <button type="button" id="btn-new-report-2" class="ghost">＋ New report</button>
+        <button value="close" class="primary">Close</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <!-- All reports -->
+  <dialog id="dlg-reports">
+    <form method="dialog">
+      <h2>Reports on this phone</h2>
+      <p id="reports-space" class="small"></p>
+      <div id="reports-list" class="list"></div>
+      <menu>
         <button value="close" class="ghost">Close</button>
       </menu>
     </form>
   </dialog>
 
+  <!-- Viewer -->
+  <dialog id="dlg-viewer" class="viewer-dlg">
+    <form method="dialog">
+      <div id="viewer-box"></div>
+      <p id="viewer-name" class="small"></p>
+      <menu><button value="close" class="primary">Close</button></menu>
+    </form>
+  </dialog>
+
+  <!-- Confirmation for anything destructive -->
+  <dialog id="dlg-confirm">
+    <form method="dialog">
+      <h2 id="confirm-title">Are you sure?</h2>
+      <p id="confirm-msg" class="pre"></p>
+      <menu>
+        <button value="cancel" class="ghost" autofocus>Cancel</button>
+        <button value="ok" id="confirm-ok" class="danger">Delete</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <script src="storage.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
